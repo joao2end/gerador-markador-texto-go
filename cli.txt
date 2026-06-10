@@ -1,0 +1,276 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"math"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"text/template"
+)
+
+type Config struct {
+	Nome            string
+	DiametroFuro    float64
+	EspessuraParede float64
+	EspessuraRelevo float64
+	ComprimentoTubo float64
+	LarguraTexto    float64
+	Fn              int
+	OutputDir       string
+}
+
+type ScadParams struct {
+	Texto         string
+	Lado1         string
+	Lado2         string
+	TamanhoFonte  float64
+	DiametroFuro  float64
+	EspessuraParede  float64
+	EspessuraRelevo  float64
+	ComprimentoTubo  float64
+	LarguraTexto     float64
+	RaioFuro         float64
+	RaioTubo         float64
+	RaioExterno      float64
+	Fn               int
+}
+
+const scadTemplate = `include <BOSL2/std.scad>
+
+texto = "{{.Texto}}";
+espessura_relevo = {{.EspessuraRelevo}};
+
+diametro_furo = {{.DiametroFuro}};
+espessura_parede = {{.EspessuraParede}};
+
+raio_furo = diametro_furo / 2;
+raio_tubo = raio_furo + espessura_parede;
+raio_externo = raio_tubo + espessura_relevo;
+
+comprimento_tubo = {{.ComprimentoTubo}};
+largura_texto = {{.LarguraTexto}};
+$fn = {{.Fn}};
+
+palavras = str_split(texto, " ");
+lado1 = palavras[0];
+lado2 = len(palavras) >= 2 ? palavras[1] : "";
+max_chars = max(len(lado1), len(lado2));
+tamanho_fonte = min(largura_texto * comprimento_tubo / (max(1, max_chars) * 0.65), PI * raio_tubo);
+
+module escrever_lado(txt, angulo) {
+    rotate(angulo)
+    cylindrical_extrude(ir = raio_tubo - 0.1, or = raio_externo) {
+        rotate(-90)
+        text(txt, size = tamanho_fonte, font = "Arial:style=Bold", halign = "center", valign = "center");
+    }
+}
+
+rotate([0, 90, 0])
+difference() {
+    union() {
+        cylinder(h = comprimento_tubo, r = raio_tubo, center = true);
+        escrever_lado(lado1, 0);
+        escrever_lado(lado2, 180);
+    }
+
+    cylinder(h = comprimento_tubo + 2, r = raio_furo, center = true);
+}
+`
+
+func calcFontSize(nome string, comprimento, larguraTexto, raioTubo float64) float64 {
+	parts := strings.Fields(nome)
+	lado1, lado2 := "", ""
+	if len(parts) >= 1 {
+		lado1 = parts[0]
+	}
+	if len(parts) >= 2 {
+		lado2 = parts[1]
+	}
+	maxChars := math.Max(float64(len(lado1)), float64(len(lado2)))
+	if maxChars < 1 {
+		maxChars = 1
+	}
+	fromLength := larguraTexto * comprimento / (maxChars * 0.65)
+	fromCircumference := math.Pi * raioTubo
+	return math.Min(fromLength, fromCircumference)
+}
+
+func generateScad(cfg Config) (*ScadParams, error) {
+	parts := strings.Fields(cfg.Nome)
+	lado1, lado2 := "", ""
+	if len(parts) >= 1 {
+		lado1 = parts[0]
+	}
+	if len(parts) >= 2 {
+		lado2 = parts[1]
+	}
+
+	raioFuro := cfg.DiametroFuro / 2
+	raioTubo := raioFuro + cfg.EspessuraParede
+	tamanhoFonte := calcFontSize(cfg.Nome, cfg.ComprimentoTubo, cfg.LarguraTexto, raioTubo)
+
+	sanitized := strings.ReplaceAll(cfg.Nome, " ", "_")
+	filename := fmt.Sprintf("marcador_%s.scad", sanitized)
+	outPath := filepath.Join(cfg.OutputDir, filename)
+
+	tmpl, err := template.New("scad").Parse(scadTemplate)
+	if err != nil {
+		return nil, fmt.Errorf("erro ao compilar template: %w", err)
+	}
+
+	f, err := os.Create(outPath)
+	if err != nil {
+		return nil, fmt.Errorf("erro ao criar arquivo: %w", err)
+	}
+	defer f.Close()
+
+	params := ScadParams{
+		Texto:            cfg.Nome,
+		Lado1:            lado1,
+		Lado2:            lado2,
+		TamanhoFonte:     math.Round(tamanhoFonte*100) / 100,
+		DiametroFuro:     cfg.DiametroFuro,
+		EspessuraParede:  cfg.EspessuraParede,
+		EspessuraRelevo:  cfg.EspessuraRelevo,
+		ComprimentoTubo:  cfg.ComprimentoTubo,
+		LarguraTexto:     cfg.LarguraTexto,
+		RaioFuro:         math.Round(raioFuro*100) / 100,
+		RaioTubo:         math.Round(raioTubo*100) / 100,
+		RaioExterno:      math.Round((raioTubo+cfg.EspessuraRelevo)*100) / 100,
+		Fn:               cfg.Fn,
+	}
+
+	if err := tmpl.Execute(f, params); err != nil {
+		return nil, fmt.Errorf("erro ao renderizar template: %w", err)
+	}
+
+	fmt.Printf("Arquivo SCAD gerado: %s\n", outPath)
+	fmt.Printf("  Nome: %s\n", cfg.Nome)
+	fmt.Printf("  Lado 1: %q | Lado 2: %q\n", lado1, lado2)
+	fmt.Printf("  Tamanho da fonte calculado: %.1f\n", tamanhoFonte)
+	return &params, nil
+}
+
+func exportSTL(scadPath, stlPath string) error {
+	openscadPath := "/Applications/OpenSCAD-2021.01.app/Contents/MacOS/OpenSCAD"
+	if _, err := os.Stat(openscadPath); os.IsNotExist(err) {
+		path, err := exec.LookPath("openscad")
+		if err != nil {
+			return fmt.Errorf("OpenSCAD não encontrado. Instale via: brew install openscad")
+		}
+		openscadPath = path
+	}
+
+	if _, err := os.Stat(scadPath); os.IsNotExist(err) {
+		return fmt.Errorf("arquivo SCAD não encontrado: %s", scadPath)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(stlPath), 0755); err != nil {
+		return fmt.Errorf("erro ao criar diretório de saída: %w", err)
+	}
+
+	cmd := exec.Command(openscadPath, "-o", stlPath, scadPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	fmt.Printf("Renderizando STL...\n")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("erro ao renderizar STL: %w", err)
+	}
+
+	fmt.Printf("STL gerado: %s\n", stlPath)
+
+	info, err := os.Stat(stlPath)
+	if err != nil {
+		return fmt.Errorf("erro ao verificar STL: %w", err)
+	}
+	fmt.Printf("Tamanho: %.1f KB\n", float64(info.Size())/1024)
+
+	return nil
+}
+
+func run() error {
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), `marcador-tubular - Gerador de marcadores tubulares personalizados
+
+Uso:
+  %s [opções]
+
+Exemplos:
+  %s -nome "JOÃO SILVA" -output ./saida
+  %s -nome "MARIA" -diam-furo 8.0 -parede 1.5 -stl
+
+Gera arquivos .scad paramétricos para OpenSCAD.
+Para renderizar STL: abra o .scad no OpenSCAD e pressione F6 (render lento).
+`, os.Args[0], os.Args[0], os.Args[0])
+		flag.PrintDefaults()
+	}
+	var (
+		nome            = flag.String("nome", "JÚLIA", "Nome completo (nome e sobrenome separados por espaço)")
+		diamFuro        = flag.Float64("diam-furo", 8.2, "Diâmetro do furo interno (mm)")
+		parede          = flag.Float64("parede", 2.0, "Espessura da parede do tubo (mm)")
+		relevo          = flag.Float64("relevo", 2.5, "Altura do relevo do texto (mm)")
+		comprimento     = flag.Float64("comprimento", 100, "Comprimento do tubo (mm, máx 100)")
+		larguraTexto    = flag.Float64("largura-texto", 0.7, "Fração do comprimento ocupada pelo texto (0-1)")
+		fn              = flag.Int("fn", 40, "Qualidade de renderização $fn (30-60 recomendado, menor = mais rápido)")
+		output          = flag.String("output", ".", "Diretório de saída")
+		exportar        = flag.Bool("stl", false, "Exportar STL automaticamente (lento com BOSL2)")
+		version         = flag.Bool("version", false, "Mostrar versão")
+	)
+	flag.Parse()
+
+	if *version {
+		fmt.Println("marcador-tubular v1.0.0")
+		return nil
+	}
+
+	if *larguraTexto <= 0 || *larguraTexto > 1 {
+		return fmt.Errorf("largura-texto deve estar entre 0 e 1")
+	}
+
+	absOutput, err := filepath.Abs(*output)
+	if err != nil {
+		return fmt.Errorf("erro no diretório de saída: %w", err)
+	}
+	if err := os.MkdirAll(absOutput, 0755); err != nil {
+		return fmt.Errorf("erro ao criar diretório de saída: %w", err)
+	}
+
+	cfg := Config{
+		Nome:            *nome,
+		DiametroFuro:    *diamFuro,
+		EspessuraParede: *parede,
+		EspessuraRelevo: *relevo,
+		ComprimentoTubo: *comprimento,
+		LarguraTexto:    *larguraTexto,
+		Fn:              *fn,
+		OutputDir:       absOutput,
+	}
+
+	_, err = generateScad(cfg)
+	if err != nil {
+		return err
+	}
+
+	sanitized := strings.ReplaceAll(cfg.Nome, " ", "_")
+	scadPath := filepath.Join(absOutput, fmt.Sprintf("marcador_%s.scad", sanitized))
+
+	if *exportar {
+		stlPath := filepath.Join(absOutput, fmt.Sprintf("marcador_%s.stl", sanitized))
+		if err := exportSTL(scadPath, stlPath); err != nil {
+			return fmt.Errorf("erro na exportação STL: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Erro: %v\n", err)
+		os.Exit(1)
+	}
+}
