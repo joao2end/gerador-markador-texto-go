@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"image"
-	"image/draw"
+	"image/color"
+	"image/png"
 	"math"
 	"os"
 	"os/exec"
@@ -24,16 +24,86 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
-	"github.com/fogleman/fauxgl"
 )
 
+type shadcnTheme struct{}
+
+func (shadcnTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
+	switch name {
+	case theme.ColorNameBackground:
+		return color.NRGBA{0xF8, 0xFA, 0xFC, 0xFF}
+	case theme.ColorNameForeground:
+		return color.NRGBA{0x0F, 0x17, 0x2A, 0xFF}
+	case theme.ColorNamePrimary:
+		return color.NRGBA{0x0F, 0x17, 0x2A, 0xFF}
+	case theme.ColorNameHover:
+		return color.NRGBA{0xF1, 0xF5, 0xF9, 0xFF}
+	case theme.ColorNamePressed:
+		return color.NRGBA{0xE2, 0xE8, 0xF0, 0xFF}
+	case theme.ColorNameDisabled:
+		return color.NRGBA{0xE2, 0xE8, 0xF0, 0xFF}
+	case theme.ColorNameInputBackground:
+		return color.NRGBA{0xFF, 0xFF, 0xFF, 0xFF}
+	case theme.ColorNameInputBorder:
+		return color.NRGBA{0xE2, 0xE8, 0xF0, 0xFF}
+	case theme.ColorNameScrollBar:
+		return color.NRGBA{0xCB, 0xD5, 0xE1, 0xFF}
+	case theme.ColorNameShadow:
+		return color.NRGBA{0x0F, 0x17, 0x2A, 0x08}
+	case theme.ColorNameSelection:
+		return color.NRGBA{0x0F, 0x17, 0x2A, 0x14}
+	case theme.ColorNameSuccess:
+		return color.NRGBA{0x16, 0xA3, 0x4A, 0xFF}
+	case theme.ColorNameWarning:
+		return color.NRGBA{0xD9, 0x77, 0x06, 0xFF}
+	case theme.ColorNameError:
+		return color.NRGBA{0xDC, 0x26, 0x26, 0xFF}
+	case theme.ColorNameOverlayBackground:
+		return color.NRGBA{0xFF, 0xFF, 0xFF, 0xFF}
+	case theme.ColorNameMenuBackground:
+		return color.NRGBA{0xFF, 0xFF, 0xFF, 0xFF}
+	}
+	return theme.DefaultTheme().Color(name, variant)
+}
+
+func (shadcnTheme) Font(style fyne.TextStyle) fyne.Resource {
+	return theme.DefaultTheme().Font(style)
+}
+
+func (shadcnTheme) Icon(name fyne.ThemeIconName) fyne.Resource {
+	return theme.DefaultTheme().Icon(name)
+}
+
+func (shadcnTheme) Size(name fyne.ThemeSizeName) float32 {
+	switch name {
+	case theme.SizeNamePadding:
+		return 12
+	case theme.SizeNameInlineIcon:
+		return 18
+	case theme.SizeNameScrollBar:
+		return 8
+	case theme.SizeNameSeparatorThickness:
+		return 1
+	case theme.SizeNameInputBorder:
+		return 1
+	case theme.SizeNameText:
+		return 14
+	case theme.SizeNameHeadingText:
+		return 20
+	case theme.SizeNameSubHeadingText:
+		return 16
+	case theme.SizeNameCaptionText:
+		return 12
+	}
+	return theme.DefaultTheme().Size(name)
+}
+
 type AppState struct {
-	config     Config
-	outputDir  string
-	tempDir    string
-	lastScad   string
-	log        *widget.Entry
-	previewImg *canvas.Image
+	config    Config
+	outputDir string
+	tempDir   string
+	status    *widget.Label
+	cancelSTL context.CancelFunc
 }
 
 type Config struct {
@@ -46,61 +116,41 @@ type Config struct {
 	Fn              int
 }
 
-type Viewer3D struct {
-	meshMu   sync.Mutex
-	angleMu  sync.Mutex
-
-	mesh      *fauxgl.Mesh
-	center    fauxgl.Vector
-	radius    float64
-	ctx       *fauxgl.Context
-	snapshot  *image.RGBA
-	ready     bool
-
-	yaw, pitch  float64
-	dist        float64
-	distMin     float64
-	distMax     float64
-
-	imgW, imgH  int
-	lastMX, lastMY float64
-	dragging    bool
-	renderReq   chan struct{}
-	onRender    func()
-
-	// log
-	logRenderMs func(ms int64)
+type Camera struct {
+	mu               sync.Mutex
+	yaw, pitch, dist float64
+	dragging         bool
+	lastMX, lastMY   float64
+	distMin, distMax float64
 }
 
 type ViewerWidget struct {
 	widget.BaseWidget
-	viewer  *Viewer3D
-	display *canvas.Image
+	display      *canvas.Image
+	imgW, imgH   int
+	cam          Camera
+	scrollTimer  *time.Timer
+	renderFunc   func()
+	prevRender   time.Time
+	fullW, fullH int
 }
 
 func NewViewerWidget(w, h int) *ViewerWidget {
 	vw := &ViewerWidget{
-		viewer: &Viewer3D{
-			imgW:      w,
-			imgH:      h,
-			yaw:       -30 * math.Pi / 180,
-			pitch:     25 * math.Pi / 180,
-			dist:      200,
-			ctx:       fauxgl.NewContext(w, h),
-			renderReq: make(chan struct{}, 1),
-		},
+		imgW:  w,
+		imgH:  h,
+		fullW: w,
+		fullH: h,
 		display: canvas.NewImageFromImage(nil),
-	}
-	vw.viewer.onRender = func() {
-		fyne.Do(func() {
-			vw.display.Image = vw.viewer.Image()
-			canvas.Refresh(vw.display)
-		})
+		cam: Camera{
+			yaw:   -30 * math.Pi / 180,
+			pitch: 25 * math.Pi / 180,
+			dist:  200,
+		},
 	}
 	vw.display.SetMinSize(fyne.NewSize(float32(w), float32(h)))
 	vw.display.FillMode = canvas.ImageFillContain
 	vw.ExtendBaseWidget(vw)
-	go vw.viewer.renderLoop()
 	return vw
 }
 
@@ -109,149 +159,108 @@ func (vw *ViewerWidget) CreateRenderer() fyne.WidgetRenderer {
 }
 
 func (vw *ViewerWidget) Dragged(ev *fyne.DragEvent) {
-	v := vw.viewer
+	c := &vw.cam
 	ex := float64(ev.Position.X + ev.Dragged.DX)
 	ey := float64(ev.Position.Y + ev.Dragged.DY)
 
-	v.angleMu.Lock()
-	if !v.dragging {
-		v.lastMX = ex - float64(ev.Dragged.DX)
-		v.lastMY = ey - float64(ev.Dragged.DY)
-		v.dragging = true
+	c.mu.Lock()
+	if !c.dragging {
+		c.lastMX = ex - float64(ev.Dragged.DX)
+		c.lastMY = ey - float64(ev.Dragged.DY)
+		c.dragging = true
 	}
-	dx := ex - v.lastMX
-	dy := ey - v.lastMY
-	v.lastMX = ex
-	v.lastMY = ey
-	v.yaw += dx * 0.008
-	v.pitch += dy * 0.008
-	if v.pitch > 89*math.Pi/180 {
-		v.pitch = 89 * math.Pi / 180
+	dx := ex - c.lastMX
+	dy := ey - c.lastMY
+	c.lastMX = ex
+	c.lastMY = ey
+	c.yaw -= dx * 0.008
+	c.pitch -= dy * 0.008
+	if c.pitch > 89*math.Pi/180 {
+		c.pitch = 89 * math.Pi / 180
 	}
-	if v.pitch < -89*math.Pi/180 {
-		v.pitch = -89 * math.Pi / 180
+	if c.pitch < -89*math.Pi/180 {
+		c.pitch = -89 * math.Pi / 180
 	}
-	v.angleMu.Unlock()
+	c.mu.Unlock()
 
-	v.requestRender()
+	vw.imgW = vw.fullW / 2
+	vw.imgH = vw.fullH / 2
+
+	if vw.renderFunc != nil && time.Since(vw.prevRender) >= 100*time.Millisecond {
+		vw.prevRender = time.Now()
+		vw.renderFunc()
+	}
 }
 
 func (vw *ViewerWidget) DragEnd() {
-	vw.viewer.angleMu.Lock()
-	vw.viewer.dragging = false
-	vw.viewer.angleMu.Unlock()
+	vw.cam.mu.Lock()
+	vw.cam.dragging = false
+	vw.cam.mu.Unlock()
+	vw.imgW = vw.fullW
+	vw.imgH = vw.fullH
+	if vw.renderFunc != nil {
+		vw.renderFunc()
+	}
 }
 
 func (vw *ViewerWidget) Scrolled(ev *fyne.ScrollEvent) {
-	v := vw.viewer
-	v.angleMu.Lock()
-	v.dist *= (1 - float64(ev.Scrolled.DY)*0.08)
-	if v.dist < v.distMin {
-		v.dist = v.distMin
+	c := &vw.cam
+	c.mu.Lock()
+	c.dist *= (1 - float64(ev.Scrolled.DY)*0.08)
+	if c.dist < c.distMin {
+		c.dist = c.distMin
 	}
-	if v.dist > v.distMax {
-		v.dist = v.distMax
+	if c.dist > c.distMax {
+		c.dist = c.distMax
 	}
-	v.angleMu.Unlock()
-	v.requestRender()
-}
+	c.mu.Unlock()
 
-func (v *Viewer3D) requestRender() {
-	select {
-	case v.renderReq <- struct{}{}:
-	default:
-	}
-}
+	vw.imgW = vw.fullW / 2
+	vw.imgH = vw.fullH / 2
 
-func (v *Viewer3D) renderLoop() {
-	for range v.renderReq {
-		v.render()
-		if v.onRender != nil {
-			v.onRender()
+	if vw.renderFunc != nil && time.Since(vw.prevRender) >= 100*time.Millisecond {
+		vw.prevRender = time.Now()
+		vw.renderFunc()
+	}
+
+	if vw.renderFunc != nil {
+		if vw.scrollTimer != nil {
+			vw.scrollTimer.Stop()
 		}
+		vw.scrollTimer = time.AfterFunc(200*time.Millisecond, func() {
+			vw.imgW = vw.fullW
+			vw.imgH = vw.fullH
+			vw.renderFunc()
+		})
 	}
 }
 
-func (v *Viewer3D) SetMesh(mesh *fauxgl.Mesh) {
-	v.meshMu.Lock()
-	v.mesh = mesh
-	if mesh != nil {
-		bb := mesh.BoundingBox()
-		v.center = bb.Center()
-		v.radius = bb.Size().Length() / 2
-		v.ready = true
-	}
-	v.meshMu.Unlock()
-
-	if mesh != nil {
-		v.angleMu.Lock()
-		v.dist = v.radius * 3.5
-		v.distMin = v.radius * 0.5
-		v.distMax = v.radius * 20
-		v.yaw = -30 * math.Pi / 180
-		v.pitch = 25 * math.Pi / 180
-		v.angleMu.Unlock()
-	}
+func (vw *ViewerWidget) CameraAngles() (yaw, pitch, dist float64) {
+	vw.cam.mu.Lock()
+	yaw, pitch, dist = vw.cam.yaw, vw.cam.pitch, vw.cam.dist
+	vw.cam.mu.Unlock()
+	return
 }
 
-func (v *Viewer3D) render() {
-	t0 := time.Now()
-
-	v.angleMu.Lock()
-	yaw, pitch, dist := v.yaw, v.pitch, v.dist
-	v.angleMu.Unlock()
-
-	v.meshMu.Lock()
-	if !v.ready || v.mesh == nil {
-		v.meshMu.Unlock()
-		return
-	}
-	mesh := v.mesh
-	cx, cy, cz := v.center.X, v.center.Y, v.center.Z
-	center := v.center
-	v.meshMu.Unlock()
-
-	eyeX := cx + dist*math.Cos(pitch)*math.Sin(yaw)
-	eyeY := cy + dist*math.Sin(pitch)
-	eyeZ := cz + dist*math.Cos(pitch)*math.Cos(yaw)
-	eye := fauxgl.Vector{X: eyeX, Y: eyeY, Z: eyeZ}
-	up := fauxgl.Vector{X: 0, Y: 1, Z: 0}
-
-	aspect := float64(v.imgW) / float64(v.imgH)
-	mvp := fauxgl.Perspective(30, aspect, 0.1, dist*4).Mul(fauxgl.LookAt(eye, center, up))
-
-	shader := fauxgl.NewPhongShader(mvp, fauxgl.Vector{X: 0.5, Y: 0.5, Z: 1}.Normalize(), eye)
-	shader.ObjectColor = fauxgl.HexColor("#3B82A0")
-	shader.AmbientColor = fauxgl.HexColor("#2A2A4A")
-	shader.DiffuseColor = fauxgl.HexColor("#5B9EC4")
-	shader.SpecularColor = fauxgl.HexColor("#FFFFFF")
-	shader.SpecularPower = 60
-
-	v.meshMu.Lock()
-	v.ctx.Shader = shader
-	v.ctx.ClearColor = fauxgl.HexColor("#F0F0F5")
-	v.ctx.ClearColorBuffer()
-	v.ctx.ClearDepthBuffer()
-	v.ctx.ReadDepth = true
-	v.ctx.WriteDepth = true
-	v.ctx.Cull = fauxgl.CullBack
-	v.ctx.FrontFace = fauxgl.FaceCCW
-	v.ctx.DrawMesh(mesh)
-
-	bounds := v.ctx.Image().Bounds()
-	if v.snapshot == nil || !v.snapshot.Bounds().Eq(bounds) {
-		v.snapshot = image.NewRGBA(bounds)
-	}
-	draw.Draw(v.snapshot, bounds, v.ctx.Image(), bounds.Min, draw.Src)
-	v.meshMu.Unlock()
-
-	if v.logRenderMs != nil {
-		v.logRenderMs(time.Since(t0).Milliseconds())
-	}
+func (vw *ViewerWidget) SetCameraAngles(yaw, pitch, dist float64) {
+	vw.cam.mu.Lock()
+	vw.cam.yaw = yaw
+	vw.cam.pitch = pitch
+	vw.cam.dist = dist
+	vw.cam.mu.Unlock()
 }
 
-func (v *Viewer3D) Image() image.Image {
-	return v.snapshot
+func (vw *ViewerWidget) SetCameraDistRange(min, max float64) {
+	vw.cam.mu.Lock()
+	vw.cam.distMin = min
+	vw.cam.distMax = max
+	if vw.cam.dist < min {
+		vw.cam.dist = min
+	}
+	if vw.cam.dist > max {
+		vw.cam.dist = max
+	}
+	vw.cam.mu.Unlock()
 }
 
 var scadTemplate = `include <BOSL2/std.scad>
@@ -364,8 +373,8 @@ func generateScadContent(cfg Config) string {
 	return replacer.Replace(scadTemplate)
 }
 
-func exportSTL(openscadPath, scadPath, stlPath string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+func exportSTL(openscadPath, scadPath, stlPath string, parentCtx context.Context) error {
+	ctx, cancel := context.WithTimeout(parentCtx, 120*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, openscadPath, "--backend=Manifold", "-q", "-o", stlPath, scadPath)
@@ -374,17 +383,76 @@ func exportSTL(openscadPath, scadPath, stlPath string) error {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return fmt.Errorf("OpenSCAD excedeu o tempo limite (120s)")
 		}
-		return fmt.Errorf("%v\n%s", err, string(out))
+		if errors.Is(err, context.Canceled) {
+			return fmt.Errorf("Exportação cancelada")
+		}
+		return fmt.Errorf("OpenSCAD: %v\n%s", err, string(out))
 	}
 	return nil
 }
 
+func genPreview(openscadPath, scadPath string, vw *ViewerWidget, status *widget.Label, onDone func()) {
+	t0 := time.Now()
+
+	yaw, pitch, dist := vw.CameraAngles()
+
+	eyeX := dist * math.Cos(pitch) * math.Sin(yaw)
+	eyeY := dist * math.Sin(pitch)
+	eyeZ := dist * math.Cos(pitch) * math.Cos(yaw)
+
+	pngPath := scadPath + ".preview.png"
+	camera := fmt.Sprintf("%.1f,%.1f,%.1f,0,0,0", eyeX, eyeY, eyeZ)
+	imgsz := fmt.Sprintf("%d,%d", vw.imgW, vw.imgH)
+
+	cmd := exec.Command(openscadPath,
+		"--backend=Manifold",
+		"--imgsize", imgsz,
+		"--camera", camera,
+		"-o", pngPath,
+		scadPath,
+	)
+	if err := cmd.Run(); err != nil {
+		fyne.Do(func() {
+			status.SetText(fmt.Sprintf("Erro no preview: %v", err))
+		})
+		return
+	}
+
+	f, err := os.Open(pngPath)
+	if err != nil {
+		fyne.Do(func() {
+			status.SetText(fmt.Sprintf("Erro ao abrir preview: %v", err))
+		})
+		return
+	}
+	defer f.Close()
+	img, err := png.Decode(f)
+	if err != nil {
+		fyne.Do(func() {
+			status.SetText(fmt.Sprintf("Erro ao decodificar PNG: %v", err))
+		})
+		return
+	}
+
+	elapsed := time.Since(t0)
+	fyne.Do(func() {
+		vw.display.Image = img
+		canvas.Refresh(vw.display)
+		status.SetText(fmt.Sprintf("Preview GPU em %.1fs", elapsed.Seconds()))
+		if onDone != nil {
+			onDone()
+		}
+	})
+}
+
 var rendering atomic.Bool
+var renderQueued atomic.Bool
 
 func main() {
 	a := app.New()
-	w := a.NewWindow("Marcador Tubular - Preview 3D Interativo")
-	w.Resize(fyne.NewSize(1050, 750))
+	a.Settings().SetTheme(&shadcnTheme{})
+	w := a.NewWindow("Marcador Tubular")
+	w.Resize(fyne.NewSize(1100, 720))
 
 	tempDir, _ := os.MkdirTemp("", "marcador-*")
 
@@ -405,9 +473,7 @@ func main() {
 		outputDir: ".",
 		tempDir:   tempDir,
 	}
-	state.log = widget.NewMultiLineEntry()
-	state.log.SetMinRowsVisible(3)
-	state.log.Disable()
+	state.status = widget.NewLabel("")
 
 	nomeEntry := widget.NewEntry()
 	nomeEntry.SetText(state.config.Nome)
@@ -428,14 +494,18 @@ func main() {
 
 	outputEntry := widget.NewEntry()
 	outputEntry.SetText(state.outputDir)
-	scadPreview := widget.NewMultiLineEntry()
-	scadPreview.SetMinRowsVisible(5)
-	scadPreview.Wrapping = fyne.TextWrapBreak
-	scadPreview.Disable()
+
+	ctxSTL, cancelSTL := context.WithCancel(context.Background())
+	state.cancelSTL = cancelSTL
+
+	w.SetCloseIntercept(func() {
+		state.cancelSTL()
+		os.RemoveAll(tempDir)
+		w.Close()
+	})
 
 	openscadPath := findOpenSCAD()
 	scadPath := filepath.Join(tempDir, "model.scad")
-	stlPath := filepath.Join(tempDir, "model.stl")
 
 	var previewBtn *widget.Button
 
@@ -451,14 +521,32 @@ func main() {
 		}
 	}
 
-	genPreview := func() {
+	var queueRender func()
+	queueRender = func() {
+		if openscadPath == "" {
+			return
+		}
+		if rendering.CompareAndSwap(false, true) {
+			go genPreview(openscadPath, scadPath, vw, state.status, func() {
+				rendering.Store(false)
+				if renderQueued.CompareAndSwap(true, false) {
+					queueRender()
+				}
+			})
+		} else {
+			renderQueued.Store(true)
+		}
+	}
+	vw.renderFunc = queueRender
+
+	requestPreview := func() {
 		if openscadPath == "" {
 			dialog.ShowError(fmt.Errorf("OpenSCAD não encontrado"), w)
 			return
 		}
 
 		if !rendering.CompareAndSwap(false, true) {
-			state.log.SetText("Já existe uma operação em andamento. Aguarde...")
+			state.status.SetText("Renderizando... aguarde")
 			return
 		}
 
@@ -467,104 +555,62 @@ func main() {
 
 		content := generateScadContent(state.config)
 		if err := os.WriteFile(scadPath, []byte(content), 0644); err != nil {
-			state.log.SetText(fmt.Sprintf("Erro ao escrever SCAD: %v", err))
+			state.status.SetText(fmt.Sprintf("Erro: %v", err))
 			previewBtn.Enable()
 			rendering.Store(false)
 			return
 		}
 
-		state.log.SetText("Exportando STL com Manifold...")
-		tStartSTL := time.Now()
+		vw.SetCameraDistRange(30, 500)
 
-		go func() {
-			tSTL := time.Now()
-			if err := exportSTL(openscadPath, scadPath, stlPath); err != nil {
-				fyne.Do(func() {
-					state.log.SetText(fmt.Sprintf("Erro: %v", err))
-					previewBtn.Enable()
-					rendering.Store(false)
-				})
-				return
-			}
-			elapsedSTL := time.Since(tSTL)
+		state.status.SetText("Renderizando preview...")
 
-			state.log.SetText(fmt.Sprintf("STL em %.1fs. Carregando malha...", elapsedSTL.Seconds()))
-			tLoad := time.Now()
-			mesh, err := fauxgl.LoadSTL(stlPath)
-			if err != nil {
-				fyne.Do(func() {
-					state.log.SetText(fmt.Sprintf("Erro ao carregar STL: %v", err))
-					previewBtn.Enable()
-					rendering.Store(false)
-				})
-				return
-			}
-			elapsedLoad := time.Since(tLoad)
-
-			vw.viewer.SetMesh(mesh)
-			ntri := 0
-			if mesh != nil {
-				ntri = len(mesh.Triangles)
-			}
-
-			vw.viewer.logRenderMs = func(ms int64) {
-				fyne.Do(func() {
-					state.log.SetText(fmt.Sprintf(
-						"✓ STL: %.1fs | Load: %.0fms | %d tri | Render: %dms\n  Arraste para orbitar | Scroll para zoom",
-						elapsedSTL.Seconds(), float64(elapsedLoad.Microseconds())/1000, ntri, ms,
-					))
-				})
-			}
-
-			vw.viewer.render()
-			img := vw.viewer.Image()
-
+		go genPreview(openscadPath, scadPath, vw, state.status, func() {
 			fyne.Do(func() {
-				vw.display.Image = img
-				canvas.Refresh(vw.display)
-				state.lastScad = scadPath
 				previewBtn.Enable()
-				rendering.Store(false)
 			})
-		}()
+			rendering.Store(false)
+			if renderQueued.CompareAndSwap(true, false) {
+				queueRender()
+			}
+		})
 	}
 
-	genBtn := widget.NewButtonWithIcon("Gerar .SCAD", theme.DocumentCreateIcon(), func() {
+	genBtn := &widget.Button{}
+	genBtn = widget.NewButtonWithIcon("SCAD", theme.DocumentCreateIcon(), func() {
 		state.config = buildConfig()
 		sanitized := strings.ReplaceAll(state.config.Nome, " ", "_")
 		out := filepath.Join(state.outputDir, fmt.Sprintf("marcador_%s.scad", sanitized))
 		if err := os.WriteFile(out, []byte(generateScadContent(state.config)), 0644); err != nil {
-			state.log.SetText(fmt.Sprintf("Erro ao salvar SCAD: %v", err))
+			state.status.SetText(fmt.Sprintf("Erro: %v", err))
 			return
 		}
-		state.lastScad = out
-		state.log.SetText(fmt.Sprintf("✓ SCAD salvo: %s", out))
+		state.status.SetText(fmt.Sprintf("SCAD salvo: %s", filepath.Base(out)))
 	})
 
 	var exportBtn *widget.Button
-	exportBtn = widget.NewButtonWithIcon("Exportar STL (salvar)", theme.DownloadIcon(), func() {
+	exportBtn = widget.NewButtonWithIcon("STL", theme.DownloadIcon(), func() {
 		if openscadPath == "" {
 			dialog.ShowError(fmt.Errorf("OpenSCAD não encontrado"), w)
 			return
 		}
 
 		if !rendering.CompareAndSwap(false, true) {
-			state.log.SetText("Já existe uma operação em andamento. Aguarde...")
+			state.status.SetText("Exportando... aguarde")
 			return
 		}
 
 		exportBtn.Disable()
 		state.config = buildConfig()
-		state.log.SetText("Exportando STL...")
+		state.status.SetText("Exportando STL...")
 
 		go func() {
-			defer rendering.Store(false)
-
 			tmp, err := os.CreateTemp(tempDir, "export-*.scad")
 			if err != nil {
 				fyne.Do(func() {
-					state.log.SetText(fmt.Sprintf("Erro ao criar temp: %v", err))
+					state.status.SetText(fmt.Sprintf("Erro: %v", err))
 					exportBtn.Enable()
+					rendering.Store(false)
 				})
 				return
 			}
@@ -572,8 +618,9 @@ func main() {
 			if _, err := tmp.Write([]byte(generateScadContent(state.config))); err != nil {
 				tmp.Close()
 				fyne.Do(func() {
-					state.log.SetText(fmt.Sprintf("Erro ao escrever: %v", err))
+					state.status.SetText(fmt.Sprintf("Erro: %v", err))
 					exportBtn.Enable()
+					rendering.Store(false)
 				})
 				return
 			}
@@ -582,10 +629,11 @@ func main() {
 			sanitized := strings.ReplaceAll(state.config.Nome, " ", "_")
 			out := filepath.Join(state.outputDir, fmt.Sprintf("marcador_%s.stl", sanitized))
 
-			if err := exportSTL(openscadPath, tmpPath, out); err != nil {
+			if err := exportSTL(openscadPath, tmpPath, out, ctxSTL); err != nil {
 				fyne.Do(func() {
-					state.log.SetText(fmt.Sprintf("Erro: %v", err))
+					state.status.SetText(fmt.Sprintf("Erro: %v", err))
 					exportBtn.Enable()
+					rendering.Store(false)
 				})
 				return
 			}
@@ -597,26 +645,15 @@ func main() {
 			}
 
 			fyne.Do(func() {
-				state.log.SetText(fmt.Sprintf("✓ STL salvo: %s (%.1f KB)", out, sz))
+				state.status.SetText(fmt.Sprintf("STL exportado: %s (%.0f KB)", filepath.Base(out), sz))
 				exportBtn.Enable()
-				dialog.ShowInformation("STL Exportado", fmt.Sprintf("%s\n%.1f KB", out, sz), w)
+				dialog.ShowInformation("STL Exportado", fmt.Sprintf("%s\n%.0f KB", out, sz), w)
+				rendering.Store(false)
 			})
 		}()
 	})
 
-	openBtn := widget.NewButtonWithIcon("Abrir no OpenSCAD", theme.ComputerIcon(), func() {
-		if state.lastScad == "" {
-			state.lastScad = filepath.Join(state.outputDir, "marcador.scad")
-		}
-		if _, err := os.Stat(state.lastScad); os.IsNotExist(err) {
-			state.lastScad = scadPath
-		}
-		if openscadPath != "" {
-			exec.Command("open", "-a", openscadPath, state.lastScad).Start()
-		}
-	})
-
-	folderBtn := widget.NewButton("📁", func() {
+	folderBtn := widget.NewButtonWithIcon("", theme.FolderOpenIcon(), func() {
 		dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
 			if err == nil && uri != nil {
 				state.outputDir = uri.Path()
@@ -625,74 +662,81 @@ func main() {
 		}, w)
 	})
 
-	previewBtn = widget.NewButtonWithIcon("▶ Carregar Preview 3D", theme.VisibilityIcon(), genPreview)
+	previewBtn = widget.NewButtonWithIcon("Carregar Preview 3D", theme.VisibilityIcon(), requestPreview)
 
 	form := widget.NewForm(
 		&widget.FormItem{Text: "Nome", Widget: nomeEntry, HintText: "Nome + Sobrenome"},
-		&widget.FormItem{Text: "Diâmetro do Furo (mm)", Widget: diamFuroEntry, HintText: "8.2 (lápis)"},
-		&widget.FormItem{Text: "Espessura da Parede (mm)", Widget: paredeEntry, HintText: "2.0"},
-		&widget.FormItem{Text: "Altura do Relevo (mm)", Widget: relevoEntry, HintText: "2.5"},
-		&widget.FormItem{Text: "Comprimento do Tubo (mm)", Widget: comprimentoEntry, HintText: "máx 100"},
-		&widget.FormItem{Text: "Largura do Texto", Widget: container.NewBorder(nil, nil, widget.NewLabel("30%"), larguraLabel, larguraSlider)},
-		&widget.FormItem{Text: "$fn (qualidade)", Widget: fnEntry, HintText: "20-30 rápido"},
+		&widget.FormItem{Text: "Furo (mm)", Widget: diamFuroEntry, HintText: "8.2"},
+		&widget.FormItem{Text: "Parede (mm)", Widget: paredeEntry, HintText: "2.0"},
+		&widget.FormItem{Text: "Relevo (mm)", Widget: relevoEntry, HintText: "2.5"},
+		&widget.FormItem{Text: "Comprimento (mm)", Widget: comprimentoEntry, HintText: "máx 100"},
+		&widget.FormItem{Text: "Largura texto", Widget: container.NewBorder(nil, nil, widget.NewLabel("30%"), larguraLabel, larguraSlider)},
+		&widget.FormItem{Text: "Qualidade $fn", Widget: fnEntry, HintText: "20-30 rápido"},
 	)
 
 	outputRow := container.NewBorder(nil, nil, nil, folderBtn, outputEntry)
 
-	leftPanel := container.NewVBox(
-		widget.NewLabelWithStyle("Configuração", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+	formCard := container.NewVBox(
+		widget.NewLabelWithStyle("Marcador Tubular", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+		container.NewPadded(widget.NewSeparator()),
 		form,
-		widget.NewLabelWithStyle("Diretório:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		outputRow,
-		container.NewHBox(layout.NewSpacer(), genBtn, layout.NewSpacer()),
+		container.NewPadded(widget.NewSeparator()),
+		container.NewVBox(
+			widget.NewLabelWithStyle("Diretório", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+			outputRow,
+		),
+		container.NewPadded(layout.NewSpacer()),
+		container.NewGridWithColumns(2, genBtn, exportBtn),
+	)
+
+	leftPanel := container.NewPadded(container.NewBorder(
+		nil, nil, nil, nil,
+		formCard,
+	))
+
+	makeViewBtn := func(label string, icon fyne.Resource, yaw, pitch, dist float64) *widget.Button {
+		return widget.NewButtonWithIcon(label, icon, func() {
+			vw.SetCameraAngles(yaw, pitch, dist)
+			if vw.renderFunc != nil {
+				vw.renderFunc()
+			}
+		})
+	}
+
+	viewToolbar := container.NewHBox(
+		layout.NewSpacer(),
+		makeViewBtn("", theme.NavigateBackIcon(), 0, 0, 200),
+		makeViewBtn("", theme.ContentUndoIcon(), math.Pi, 0, 200),
+		makeViewBtn("", theme.NavigateBackIcon(), -math.Pi/2, 0, 200),
+		makeViewBtn("", theme.NavigateNextIcon(), math.Pi/2, 0, 200),
+		makeViewBtn("", theme.MoveUpIcon(), 0, math.Pi/2, 200),
+		makeViewBtn("", theme.ComputerIcon(), -30*math.Pi/180, 25*math.Pi/180, 200),
+		layout.NewSpacer(),
 	)
 
 	rightPanel := container.NewBorder(
 		container.NewVBox(
-			widget.NewLabelWithStyle("Preview 3D Interativo", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+			widget.NewLabelWithStyle("Preview 3D", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
 			widget.NewLabelWithStyle("Arraste para orbitar · Scroll para zoom", fyne.TextAlignCenter, fyne.TextStyle{}),
 		),
-		container.NewHBox(layout.NewSpacer(), previewBtn, layout.NewSpacer()),
+		container.NewVBox(
+			viewToolbar,
+			container.NewHBox(layout.NewSpacer(), previewBtn, layout.NewSpacer()),
+			state.status,
+		),
 		nil, nil,
 		vw,
 	)
 
 	split := container.NewHSplit(leftPanel, rightPanel)
-	split.SetOffset(0.38)
+	split.SetOffset(0.35)
 
-	bottom := container.NewVBox(
-		widget.NewLabelWithStyle("Código SCAD:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		scadPreview,
-		widget.NewLabelWithStyle("Log:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		state.log,
-		container.NewHBox(exportBtn, openBtn, layout.NewSpacer(), widget.NewButtonWithIcon("Sair", theme.CancelIcon(), func() { w.Close() })),
-	)
-
-	w.SetContent(container.NewBorder(nil, bottom, nil, nil, split))
-
-	updateCode := func() {
-		scadPreview.SetText(generateScadContent(buildConfig()))
-	}
-
-	larguraSlider.OnChanged = func(v float64) {
-		larguraLabel.SetText(fmt.Sprintf("%.0f%%", v*100))
-		updateCode()
-	}
-	onChange := func(_ string) { updateCode() }
-	nomeEntry.OnChanged = onChange
-	diamFuroEntry.OnChanged = onChange
-	paredeEntry.OnChanged = onChange
-	relevoEntry.OnChanged = onChange
-	comprimentoEntry.OnChanged = onChange
-	fnEntry.OnChanged = onChange
-
-	w.SetOnClosed(func() { os.RemoveAll(tempDir) })
-	updateCode()
+	w.SetContent(split)
 
 	if openscadPath == "" {
-		state.log.SetText("⚠ OpenSCAD não encontrado. Instale com: brew install openscad")
+		state.status.SetText("OpenSCAD não encontrado. Instale com: brew install openscad")
 	} else {
-		state.log.SetText("✓ OpenSCAD OK. Clique em \"Carregar Preview 3D\" para visualizar o modelo.")
+		state.status.SetText("Clique em Carregar Preview 3D para visualizar")
 	}
 
 	w.ShowAndRun()
@@ -713,3 +757,5 @@ func parseIntDef(s string, d int) int {
 	}
 	return v
 }
+
+
